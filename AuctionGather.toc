@@ -1,0 +1,22 @@
+## Interface: 20505
+## Interface-BCC: 20505
+## Interface-Classic: 11503
+## Title: AuctionGather
+## Notes: Lightweight auction scanner - listens and stores encoded auction data
+## Notes-ruRU: Лёгкий сканер аукциона - слушает и сохраняет закодированные данные
+## Author: n1ghtwolf
+## Version: 0.1.0
+## SavedVariables: AUCTION_GATHER_DATA, AUCTION_GATHER_CONFIG, AUCTION_GATHER_DEBUG_LOG
+## SavedVariablesPerCharacter: AUCTION_GATHER_CHARACTER
+
+# Libraries (load first)
+Libs/LibDeflate.lua
+
+# Core initialization
+Core.lua
+
+# Modules (order matters)
+Encoder.lua
+Storage.lua
+Scanner.lua
+Events.lua
