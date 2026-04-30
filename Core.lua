@@ -165,11 +165,29 @@ function AG:GetRegion()
     return regions[regionId] or "Unknown"
 end
 
--- Utility: Get realm key for storage (Realm-Faction)
+-- Detection uses tocVersion from GetBuildInfo(): expansion * 10000 + minor * 100 + patch.
+function AG:GetGameVersion()
+    local _, _, _, tocVersion = GetBuildInfo()
+    if not tocVersion then return "unknown" end
+
+    local expansion = math.floor(tocVersion / 10000)
+    local versions = {
+        [1] = "classic",
+        [2] = "tbc",
+    }
+    return versions[expansion] or ("exp" .. expansion)
+end
+
+function AG:GetGameBuild()
+    local version = GetBuildInfo()
+    return version or "unknown"
+end
+
 function AG:GetRealmKey()
+    local version = self:GetGameVersion()
     local realm = self:GetRealmNameNormalized()
     local faction = UnitFactionGroup("player") or "Unknown"
-    return realm .. "-" .. faction
+    return version .. "-" .. realm .. "-" .. faction
 end
 
 -- Utility: Get current timestamp
@@ -255,6 +273,7 @@ SlashCmdList["AUCTIONGATHER"] = function(msg)
     if cmd == "" or cmd == "help" then
         AG:Print("Commands:")
         print("  /ag status - Show addon status")
+        print("  /ag version - Show what gv/build/realmKey would be sent to the server")
         print("  /ag realms - Show all stored realm scans")
         print("  /ag last - Show last scan info")
         print("  /ag config - Show configuration")
@@ -266,12 +285,31 @@ SlashCmdList["AUCTIONGATHER"] = function(msg)
         print("  /ag clear - Clear all data")
         print("  /ag clear <realm> - Clear specific realm")
 
+    elseif cmd == "version" then
+        -- Debug helper: prints exactly the fields that would land in the SavedVariables
+        local _, build, _, tocVersion = GetBuildInfo()
+        local gv = AG:GetGameVersion()
+        local versionColor = (gv == "unknown") and "|cFFFF6600" or "|cFF00FF00"
+
+        AG:Print("Payload preview (next scan would send):")
+        print("  gv:       " .. versionColor .. gv .. "|r")
+        print("  build:    " .. (build or "?"))
+        print("  toc:      " .. tostring(tocVersion or "?"))
+        print("  realm:    " .. AG:GetRealmNameNormalized())
+        print("  faction:  " .. (UnitFactionGroup("player") or "Unknown"))
+        print("  region:   " .. AG:GetRegion())
+
+        if gv == "unknown" then
+            print("|cFFFF6600Note:|r Could not detect expansion from tocVersion.")
+        end
+
     elseif cmd == "status" then
         AG:Print("Status:")
         print("  Initialized: " .. tostring(AG.State.initialized))
         print("  AH Open: " .. tostring(AG.State.auctionHouseOpen))
         print("  Current realm: " .. AG:GetRealmKey())
         print("  Region: " .. AG:GetRegion())
+        print("  Game version: " .. AG:GetGameVersion() .. " (" .. AG:GetGameBuild() .. ")")
         if AG.Storage then
             print("  Stored realms: " .. AG.Storage:GetRealmCount())
             print("  Total size: " .. AG:FormatNumber(AG.Storage:GetStorageSize()) .. " bytes")

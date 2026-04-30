@@ -12,7 +12,9 @@ AG.Storage = {}
 local Storage = AG.Storage
 
 -- Data structure version (for migrations)
-local DATA_VERSION = 1  -- Realm-based structure with obfuscation
+-- v2: realm key includes game version prefix (Version-Realm-Faction) and each scan
+--     stores gv/build fields. Old v1 keys (Realm-Faction) are wiped on migration.
+local DATA_VERSION = 2
 
 -- Minimum thresholds to save (filter out partial searches and single-item queries)
 local MIN_AUCTIONS = 500
@@ -174,12 +176,14 @@ function Storage:SaveScan(scanData, isEarlyTermination)
     end
 
     -- Get identifiers
-    local realmKey = AG:GetRealmKey()
-    local realm = AG:GetRealmNameNormalized()
-    local faction = UnitFactionGroup("player") or "Unknown"
-    local region = AG:GetRegion()
-    local timestamp = AG:GetTimestamp()
-    local character = UnitName("player") or "Unknown"
+    local realmKey    = AG:GetRealmKey()
+    local realm       = AG:GetRealmNameNormalized()
+    local faction     = UnitFactionGroup("player") or "Unknown"
+    local region      = AG:GetRegion()
+    local gameVersion = AG:GetGameVersion()
+    local gameBuild   = AG:GetGameBuild()
+    local timestamp   = AG:GetTimestamp()
+    local character   = UnitName("player") or "Unknown"
 
     AG:Debug("Saving scan for " .. realmKey .. " (" .. totalAuctions .. " auctions)")
 
@@ -198,16 +202,18 @@ function Storage:SaveScan(scanData, isEarlyTermination)
 
     -- Cache for display (runtime only)
     self.lastScanInfo = {
-        realmKey = realmKey,
-        realm = realm,
-        faction = faction,
-        region = region,
-        timestamp = timestamp,
+        realmKey      = realmKey,
+        realm         = realm,
+        faction       = faction,
+        region        = region,
+        gameVersion   = gameVersion,
+        gameBuild     = gameBuild,
+        timestamp     = timestamp,
         totalAuctions = totalAuctions,
-        uniqueItems = uniqueItems,
+        uniqueItems   = uniqueItems,
     }
 
-    -- Save to realm slot (overwrites previous scan for this realm+faction)
+    -- Save to realm slot (overwrites previous scan for this realm+faction+version)
     AUCTION_GATHER_DATA.realms[realmKey] = {
         -- Metadata (readable without decoding)
         t = timestamp,              -- unix timestamp
@@ -215,10 +221,12 @@ function Storage:SaveScan(scanData, isEarlyTermination)
         u = uniqueItems,            -- unique items count
 
         -- Identification
-        realm = realm,              -- realm name (English)
+        realm   = realm,            -- realm name (English)
         faction = faction,          -- Horde/Alliance/Neutral
-        region = region,            -- EU/US/KR/TW/CN
-        char = character,           -- who scanned
+        region  = region,           -- EU/US/KR/TW/CN
+        gv      = gameVersion,      -- short code: classic/tbc/wotlk/cata/mop/...
+        build   = gameBuild,        -- full build string, e.g. "3.4.1"
+        char    = character,        -- who scanned
 
         -- Diagnostics
         mode = mode,                -- "getall", "paged", or "manual"
@@ -302,12 +310,14 @@ function Storage:SaveEncoded(metadata, isEarlyTermination)
     end
 
     -- Get identifiers
-    local realmKey  = AG:GetRealmKey()
-    local realm     = AG:GetRealmNameNormalized()
-    local faction   = UnitFactionGroup("player") or "Unknown"
-    local region    = AG:GetRegion()
-    local timestamp = AG:GetTimestamp()
-    local character = UnitName("player") or "Unknown"
+    local realmKey    = AG:GetRealmKey()
+    local realm       = AG:GetRealmNameNormalized()
+    local faction     = UnitFactionGroup("player") or "Unknown"
+    local region      = AG:GetRegion()
+    local gameVersion = AG:GetGameVersion()
+    local gameBuild   = AG:GetGameBuild()
+    local timestamp   = AG:GetTimestamp()
+    local character   = UnitName("player") or "Unknown"
 
     AG:Debug("SaveEncoded: persisting scan for " .. realmKey .. " (" .. totalAuctions .. " auctions)")
 
@@ -320,12 +330,14 @@ function Storage:SaveEncoded(metadata, isEarlyTermination)
         realm         = realm,
         faction       = faction,
         region        = region,
+        gameVersion   = gameVersion,
+        gameBuild     = gameBuild,
         timestamp     = timestamp,
         totalAuctions = totalAuctions,
         uniqueItems   = uniqueItems,
     }
 
-    -- Save to realm slot (overwrites previous scan for this realm+faction)
+    -- Save to realm slot (overwrites previous scan for this realm+faction+version)
     AUCTION_GATHER_DATA.realms[realmKey] = {
         -- Metadata (readable without decoding)
         t = timestamp,      -- unix timestamp
@@ -333,10 +345,12 @@ function Storage:SaveEncoded(metadata, isEarlyTermination)
         u = uniqueItems,    -- unique items count
 
         -- Identification
-        realm   = realm,    -- realm name (English)
-        faction = faction,  -- Horde/Alliance/Neutral
-        region  = region,   -- EU/US/KR/TW/CN
-        char    = character, -- who scanned
+        realm   = realm,        -- realm name (English)
+        faction = faction,      -- Horde/Alliance/Neutral
+        region  = region,       -- EU/US/KR/TW/CN
+        gv      = gameVersion,  -- short code: classic/tbc/wotlk/cata/mop/...
+        build   = gameBuild,    -- full build string, e.g. "3.4.1"
+        char    = character,    -- who scanned
 
         -- Diagnostics
         mode  = mode,                -- "getall", "paged", or "manual"
@@ -417,9 +431,10 @@ function Storage:PrintStatus()
             ageStr = math.floor(age / 86400) .. "d ago"
         end
 
-        print(string.format("  %s [%s]: %s auctions, %s items (%s)",
+        print(string.format("  %s [%s/%s]: %s auctions, %s items (%s)",
             realmKey,
             data.region or "??",
+            data.gv or "?",
             AG:FormatNumber(data.n or 0),
             AG:FormatNumber(data.u or 0),
             ageStr
@@ -439,6 +454,8 @@ function Storage:PrintLastScan()
         print("  Realm: " .. (self.lastScanInfo.realm or "unknown"))
         print("  Faction: " .. (self.lastScanInfo.faction or "unknown"))
         print("  Region: " .. (self.lastScanInfo.region or "unknown"))
+        print("  Version: " .. (self.lastScanInfo.gameVersion or "unknown") ..
+              " (" .. (self.lastScanInfo.gameBuild or "?") .. ")")
         print("  Time: " .. date("%Y-%m-%d %H:%M:%S", self.lastScanInfo.timestamp or 0))
         print("  Total auctions: " .. AG:FormatNumber(self.lastScanInfo.totalAuctions or 0))
         print("  Unique items: " .. AG:FormatNumber(self.lastScanInfo.uniqueItems or 0))
