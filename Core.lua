@@ -10,8 +10,8 @@
 local ADDON_NAME, AG = ...
 
 -- Version info
-AG.VERSION = "0.1.0"
-AG.BUILD = 1
+AG.VERSION = "0.2.7"
+AG.BUILD = 9
 
 -- Debug mode (off by default, toggle with /ag debug)
 AG.DEBUG = false
@@ -26,9 +26,12 @@ AG.State = {
 -- Default configuration
 AG.Defaults = {
     config = {
-        autoScan = true,      -- Automatically scan auction house data
-        includeOwner = true,  -- Store seller names
-        includeBid = true,    -- Store bid information
+        autoScan = true,         -- Listens auction data when a scan arrives (passive)
+        includeOwner = true,     -- Store seller names
+        includeBid = true,       -- Store bid information
+        autoTriggerScan = false, -- Modern AH only: actively start a full scan on AH open
+                                 -- (off by default to avoid the shared 15-min cooldown
+                                 --  when another scanner addon is present)
     },
 }
 
@@ -174,6 +177,9 @@ function AG:GetGameVersion()
     local versions = {
         [1] = "classic",
         [2] = "tbc",
+        [3] = "wotlk",
+        [4] = "cata",
+        [5] = "mop",
     }
     return versions[expansion] or ("exp" .. expansion)
 end
@@ -274,6 +280,8 @@ SlashCmdList["AUCTIONGATHER"] = function(msg)
         AG:Print("Commands:")
         print("  /ag status - Show addon status")
         print("  /ag version - Show what gv/build/realmKey would be sent to the server")
+        print("  /ag scan - Trigger a full auction scan (modern AH only, e.g. MoP)")
+        print("  /ag autotrigger - Toggle auto full-scan on AH open (modern AH only)")
         print("  /ag realms - Show all stored realm scans")
         print("  /ag last - Show last scan info")
         print("  /ag config - Show configuration")
@@ -303,6 +311,29 @@ SlashCmdList["AUCTIONGATHER"] = function(msg)
             print("|cFFFF6600Note:|r Could not detect expansion from tocVersion.")
         end
 
+    elseif cmd == "scan" then
+        -- Manual full-scan trigger. Only the modern (C_AuctionHouse) backend
+        -- supports actively initiating a scan; legacy relies on passive listening.
+        local backend = AG.Scanner and AG.Scanner.active
+        if backend and backend.TriggerScan then
+            backend:TriggerScan()
+        else
+            AG:Print("|cFFFF6600Manual scan unavailable on this client.|r Open the AH and scan via another addon (GetAll), or let auto-scan run.")
+        end
+
+    elseif cmd == "autotrigger" then
+        -- Toggle actively initiating a full scan when the AH opens (modern AH only).
+        if not AUCTION_GATHER_CONFIG then
+            AG:Print("|cFFFF6600Config not loaded.|r Try |cFFFFFF00/reload|r.")
+        else
+            AUCTION_GATHER_CONFIG.autoTriggerScan = not AUCTION_GATHER_CONFIG.autoTriggerScan
+            AG:Print("Auto full-scan on AH open: " ..
+                (AUCTION_GATHER_CONFIG.autoTriggerScan and "|cFF00FF00ON|r" or "|cFFFF6600OFF|r"))
+            if AUCTION_GATHER_CONFIG.autoTriggerScan then
+                print("  Modern AH only (MoP/Cata/Retail). Leave OFF if you run another scanner (Auctionator/TSM).")
+            end
+        end
+
     elseif cmd == "status" then
         AG:Print("Status:")
         print("  Initialized: " .. tostring(AG.State.initialized))
@@ -310,6 +341,20 @@ SlashCmdList["AUCTIONGATHER"] = function(msg)
         print("  Current realm: " .. AG:GetRealmKey())
         print("  Region: " .. AG:GetRegion())
         print("  Game version: " .. AG:GetGameVersion() .. " (" .. AG:GetGameBuild() .. ")")
+        local activeBackend = AG.Scanner and AG.Scanner.active
+        local backendName
+        if activeBackend == nil then
+            backendName = "|cFFFF6600NONE — backend not loaded!|r"
+        elseif AG.Scanner and activeBackend == AG.Scanner.modern then
+            backendName = "modern (C_AuctionHouse / replicate)"
+        elseif AG.Scanner and activeBackend == AG.Scanner.legacy then
+            backendName = "legacy (GetAuctionItemInfo / GetAll)"
+        else
+            backendName = "unknown"
+        end
+        print("  Scanner backend: " .. backendName)
+        print("  Backends loaded: legacy=" .. tostring(AG.Scanner and AG.Scanner.legacy ~= nil)
+            .. ", modern=" .. tostring(AG.Scanner and AG.Scanner.modern ~= nil))
         if AG.Storage then
             print("  Stored realms: " .. AG.Storage:GetRealmCount())
             print("  Total size: " .. AG:FormatNumber(AG.Storage:GetStorageSize()) .. " bytes")

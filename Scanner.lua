@@ -1,12 +1,20 @@
 --[[
     AuctionGather - Lightweight Auction Scanner
-    Scanner.lua - Auction data processing
+    Scanner.lua - Shared scan engine + backend dispatcher
 
-    Uses accumulator pattern to support both GetAll (full scan)
-    and page-by-page scanning (e.g. Auctionator).
+    This file holds the API-agnostic engine: the accumulator that collects
+    auctions across events, the debounced finalizer, and the async
+    serialize -> encode -> save pipeline.
 
-    GetAll: single large event → batched read → accumulate → finalize
-    Page-by-page: many small events → read immediately → accumulate → finalize after silence
+    The actual reading of auctions from the WoW API lives in two backends,
+    selected at runtime by Scanner:SelectBackend():
+      - AG.Scanner.legacy (ScannerLegacy.lua) - GetAuctionItemInfo / GetAll
+                                                 (vanilla, tbc, wrath)
+      - AG.Scanner.modern (ScannerModern.lua) - C_AuctionHouse replicate
+                                                 (cata, mists/MoP, retail)
+
+    Both backends feed the same accumulator and reuse this engine's pipeline,
+    so the serialized output format is identical regardless of source.
 ]]
 
 local ADDON_NAME, AG = ...
@@ -14,30 +22,27 @@ local ADDON_NAME, AG = ...
 AG.Scanner = {}
 local Scanner = AG.Scanner
 
--- Scanner configuration
-local BATCH_SIZE = 200          -- Items per batch for GetAll (smaller = less CPU spike)
-local BATCH_DELAY = 0.05        -- Delay between batches in seconds (GetAll only)
-local DEBOUNCE_DELAY = 2.0      -- Silence period before finalizing (seconds)
-local GETALL_THRESHOLD = 200    -- batch==total and above this = GetAll mode
-
--- Async save pipeline configuration
+-- Debounce + async save pipeline configuration (engine-owned, backend-agnostic)
+local DEBOUNCE_DELAY = 2.0          -- Silence period before finalizing (seconds)
 local ASYNC_SERIALIZE_CHUNK = 500   -- items per tick during serialization
 local ASYNC_ENCODE_CHUNK = 30000    -- bytes per tick during encoding (must be multiple of 3)
 local ASYNC_STEP_DELAY = 0.02       -- seconds between async ticks
 
--- Scanner state
+-- Scanner state (shared by whichever backend is active)
 Scanner.state = {
-    isProcessing = false,       -- True during batched GetAll reading
+    isProcessing = false,       -- True during batched reading
     pendingFinalize = false,    -- Debounce flag for finalization
-    lastEventTime = 0,          -- Last OnDataReceived time (for debounce)
+    lastEventTime = 0,          -- Last data-received time (for debounce)
     startTime = 0,              -- When scanning started (for duration calc)
-    currentIndex = 0,           -- Current batch index (GetAll only)
-    totalItems = 0,             -- Total items to read (GetAll only)
+    currentIndex = 0,           -- Current batch cursor (batched read)
+    totalItems = 0,             -- Total items to read (batched read)
     scanSavedThisSession = false, -- True after a scan was saved this AH session
                                   -- Prevents AH browsing from creating a new accumulator
                                   -- and overwriting the saved scan. Reset on AH reopen.
-    pendingCloseFinalize = false, -- True when AH closed while GetAll batches were running.
+    pendingCloseFinalize = false, -- True when AH closed while batches were running.
                                   -- ProcessBatch will finalize directly when done.
+    capturingBackend = nil,       -- Backend (legacy/modern) running the current read;
+                                  -- decides close behaviour (see OnAuctionHouseClosed).
 }
 
 -- Accumulator: collects auctions across multiple events
@@ -47,12 +52,56 @@ Scanner.accumulator = nil
 Scanner.asyncSave = nil
 
 -- One-shot warnings: keys that have already been shown this session.
--- Prevents spamming the same warning on every AUCTION_ITEM_LIST_UPDATE.
+-- Prevents spamming the same warning on every data-received event.
 Scanner.warnedThisSession = {}
 
--- Initialize scanner
+-- Active backend (AG.Scanner.legacy or AG.Scanner.modern), chosen in Initialize
+Scanner.active = nil
+
+-- Select the auction-reading backend.
+-- IMPORTANT: do NOT detect by `C_AuctionHouse` presence. The C_AuctionHouse namespace
+-- (incl. ReplicateItems) ALSO exists on legacy-AH clients like Classic Era — but the
+-- active auction house there is still the LEGACY one. Detecting by presence wrongly routes
+-- Classic Era to the modern backend, so its GetAll (AUCTION_ITEM_LIST_UPDATE) is never
+-- captured. Mirror Auctionator: trust the project id + IsUsingLegacyAuctionClient().
+-- Legacy AH = vanilla / tbc / wrath; modern AH = cata / mists(MoP) / retail.
+function Scanner:SelectBackend()
+    local isLegacyAH =
+        WOW_PROJECT_ID == WOW_PROJECT_CLASSIC                     -- vanilla / Classic Era
+        or WOW_PROJECT_ID == WOW_PROJECT_BURNING_CRUSADE_CLASSIC  -- TBC
+        or WOW_PROJECT_ID == WOW_PROJECT_WRATH_CLASSIC            -- WotLK
+        or (IsUsingLegacyAuctionClient ~= nil and IsUsingLegacyAuctionClient())
+
+    if isLegacyAH then
+        self.active = self.legacy
+    elseif C_AuctionHouse and C_AuctionHouse.ReplicateItems then
+        self.active = self.modern
+    else
+        self.active = self.legacy  -- safe fallback (no modern AH available)
+    end
+end
+
+-- Initialize scanner: pick the backend, then let it initialize itself
 function Scanner:Initialize()
-    AG:Debug("Scanner initialized")
+    self:SelectBackend()
+
+    if not self.active then
+        AG:Warn("No scanner backend available for this client.")
+        return
+    end
+
+    -- Dual-listen: BOTH backends must be ready regardless of which one is
+    -- "active" (active only gates the manual/auto trigger). The legacy
+    -- backend's Initialize also installs the getAll watch hook.
+    if self.legacy and self.legacy.Initialize then
+        self.legacy:Initialize()
+    end
+    if self.modern and self.modern.Initialize then
+        self.modern:Initialize()
+    end
+
+    local which = (self.active == self.modern) and "modern (C_AuctionHouse)" or "legacy (GetAuctionItemInfo)"
+    AG:Debug("Scanner initialized — backend: " .. which)
 end
 
 -- Called when the auction house is opened: reset per-session state
@@ -61,6 +110,27 @@ function Scanner:OnAuctionHouseShow()
     self.state.pendingCloseFinalize = false
     self.warnedThisSession = {}  -- clear one-shot warnings so they fire again if needed
     AG:Debug("Scanner session reset (AH opened)")
+
+    -- Let the active backend react (e.g. modern auto-trigger), if it wants to
+    if self.active and self.active.OnAuctionHouseShow then
+        self.active:OnAuctionHouseShow()
+    end
+end
+
+-- Routed from Events on legacy AUCTION_ITEM_LIST_UPDATE.
+-- Delegates to the active backend (only the legacy backend does real work here).
+function Scanner:OnDataReceived()
+    if self.active and self.active.OnDataReceived then
+        self.active:OnDataReceived()
+    end
+end
+
+-- Routed from Events on modern REPLICATE_ITEM_LIST_UPDATE.
+-- Delegates to the active backend (only the modern backend does real work here).
+function Scanner:OnReplicateUpdate()
+    if self.active and self.active.OnReplicateUpdate then
+        self.active:OnReplicateUpdate()
+    end
 end
 
 -- Reset accumulator to empty state
@@ -70,7 +140,7 @@ function Scanner:ResetAccumulator(mode)
         totalAuctions = 0,
         uniqueItems = 0,
         totalBuyout = 0,
-        mode = mode or "unknown",  -- "getall" or "paged"
+        mode = mode or "unknown",  -- "getall", "replicate" or "paged"
         pagesRead = 0,
         lastReportedProgress = 0,
     }
@@ -78,7 +148,7 @@ end
 
 -- Add a single auction to the accumulator
 -- Deduplication not needed: WoW API pages don't overlap,
--- and GetAll delivers all auctions in a single batch
+-- and GetAll/replicate deliver all auctions in a single pass
 function Scanner:AccumulateAuction(auction)
     if not auction or not auction.itemId then
         return
@@ -110,201 +180,6 @@ function Scanner:AccumulateAuction(auction)
     acc.totalBuyout = acc.totalBuyout + (auction.buyout or 0)
 end
 
--- Called on each AUCTION_ITEM_LIST_UPDATE event
-function Scanner:OnDataReceived()
-    -- Don't start new reads while GetAll batched processing is running
-    if self.state.isProcessing then
-        AG:Debug("OnDataReceived: skip — isProcessing")
-        return
-    end
-
-    -- Don't start a new accumulator while background finalization is pending
-    -- (AH closed mid-batch, ProcessBatch is finishing up in the background)
-    if self.state.pendingCloseFinalize then
-        AG:Debug("OnDataReceived: skip — pendingCloseFinalize")
-        return
-    end
-
-    local batch, total = GetNumAuctionItems("list")
-    if not batch or batch == 0 then
-        return
-    end
-
-    local isGetAll = batch == total and batch >= GETALL_THRESHOLD
-
-    -- Check if AH is open.
-    -- Some addons (e.g. Auctionator) close and reopen the AH frame before scanning
-    -- without always firing AUCTION_HOUSE_SHOW, leaving our flag stuck at false.
-    -- If a GetAll batch arrived, the AH is clearly queryable — trust the data.
-    if not AG.State.auctionHouseOpen then
-        if isGetAll then
-            AG:Warn("GetAll data received but AH not detected as open — auto-correcting.")
-            AG.State.auctionHouseOpen = true
-        else
-            AG:Debug("OnDataReceived: skip — AH not open")
-            return
-        end
-    end
-
-    -- Check config
-    if not AUCTION_GATHER_CONFIG then
-        if not self.warnedThisSession["no_config"] then
-            self.warnedThisSession["no_config"] = true
-            AG:Warn("Config not loaded — Storage init may have failed. Try |cFFFFFF00/reload|r or |cFFFFFF00/ag clear|r.")
-        end
-        return
-    end
-    if not AUCTION_GATHER_CONFIG.autoScan then
-        if not self.warnedThisSession["autoscan_off"] then
-            self.warnedThisSession["autoscan_off"] = true
-            AG:Warn("autoScan is disabled — scanning is off.")
-        end
-        return
-    end
-
-    -- Initialize accumulator on first event
-    if not self.accumulator then
-        -- Only GetAll can start a new capture session.
-        -- Paged browsing/scans (batch < total) are ignored — partial data would
-        -- overwrite a legitimate full scan.
-        if not isGetAll then
-            AG:Debug(string.format("Ignoring paged event (batch=%d, total=%d)", batch, total))
-            return
-        end
-
-        self.state.startTime = debugprofilestop() / 1000
-        self.state.scanSavedThisSession = false
-        self:ResetAccumulator("getall")
-        AG:Print("|cFFFFFF00Scanning auction house...|r " .. AG:FormatNumber(total) .. " auctions (GetAll)")
-    end
-
-    if isGetAll then
-        -- GetAll: entire AH in one batch — use chunked reading to avoid client freeze
-        self.accumulator.mode = "getall"
-        -- Guard against duplicate GetAll events restarting batched reading mid-process
-        if not self.accumulator.batchedReadStarted then
-            self:StartBatchedRead(batch)
-        end
-    else
-        -- Paged event while GetAll accumulator is active — read and accumulate
-        self.accumulator.mode = self.accumulator.mode == "getall" and "getall" or "paged"
-        self:ReadCurrentPage(batch)
-    end
-
-    -- Schedule finalization (debounced)
-    self:ScheduleFinalize()
-end
-
--- Read all items from the current API buffer (page-by-page mode)
--- batch is small (~50 items), so reading synchronously is fine
-function Scanner:ReadCurrentPage(count)
-    local withOwner = AUCTION_GATHER_CONFIG.includeOwner
-    local withBid = AUCTION_GATHER_CONFIG.includeBid
-
-    for i = 1, count do
-        local ok, auction = pcall(function()
-            return self:GetAuctionInfo(i, withOwner, withBid)
-        end)
-
-        if ok and auction then
-            self:AccumulateAuction(auction)
-        end
-    end
-
-    self.accumulator.pagesRead = self.accumulator.pagesRead + 1
-    AG:Debug(string.format("Page read: %d items (total accumulated: %d)",
-        count, self.accumulator.totalAuctions))
-end
-
--- Start batched reading for GetAll mode (avoids client freeze)
-function Scanner:StartBatchedRead(total)
-    AG:Debug("Reading auction data... (" .. AG:FormatNumber(total) .. " auctions, GetAll)")
-
-    self.state.isProcessing = true
-    self.state.currentIndex = 1
-    self.state.totalItems = total
-    self.accumulator.pagesRead = 1       -- GetAll = one "page"
-    self.accumulator.batchedReadStarted = true  -- Guard against double-start
-
-    -- Start batch loop
-    self:ProcessBatch()
-end
-
--- Process a batch of auctions (GetAll mode only)
-function Scanner:ProcessBatch()
-    if not self.state.isProcessing then
-        return
-    end
-
-    -- Note: no auctionHouseOpen check here — GetAll data was already fetched from
-    -- the server before the AH window opened. The client buffer persists after close,
-    -- so processing continues to completion. OnAuctionHouseClosed sets pendingCloseFinalize.
-
-    local ok, err = pcall(function()
-        local batchEnd = math.min(
-            self.state.currentIndex + BATCH_SIZE - 1,
-            self.state.totalItems
-        )
-
-        local withOwner = AUCTION_GATHER_CONFIG and AUCTION_GATHER_CONFIG.includeOwner
-        local withBid = AUCTION_GATHER_CONFIG and AUCTION_GATHER_CONFIG.includeBid
-
-        for i = self.state.currentIndex, batchEnd do
-            local aok, auction = pcall(function()
-                return self:GetAuctionInfo(i, withOwner, withBid)
-            end)
-
-            if not aok then
-                AG:Debug("Error getting auction " .. i .. ", skipping")
-            elseif auction then
-                self:AccumulateAuction(auction)
-            end
-        end
-
-        self.state.currentIndex = batchEnd + 1
-
-        -- Report progress at 25% milestones (once per milestone)
-        local progress = math.floor((self.state.currentIndex / self.state.totalItems) * 100)
-        local milestone = progress - (progress % 25)
-        if milestone > 0 and milestone > self.accumulator.lastReportedProgress then
-            self.accumulator.lastReportedProgress = milestone
-            AG:Print("|cFFFFFF00Processing...|r " .. milestone .. "% (" ..
-                AG:FormatNumber(self.accumulator.totalAuctions) .. " auctions)")
-        end
-
-        -- Continue or finish batched reading
-        if self.state.currentIndex <= self.state.totalItems then
-            C_Timer.After(BATCH_DELAY, function()
-                Scanner:ProcessBatch()
-            end)
-        else
-            -- Batched reading done
-            AG:Print("|cFFFFFF00Processing complete.|r Saving data...")
-            self.state.isProcessing = false
-
-            -- If AH closed while we were processing, finalize directly now that all
-            -- batches are done. isEarlyTermination=false — all data was collected.
-            if self.state.pendingCloseFinalize then
-                self.state.pendingCloseFinalize = false
-                self.state.pendingFinalize = false
-                self:FinalizeAccumulator(false)
-            end
-            -- Otherwise the debounce timer handles finalization
-        end
-    end)
-
-    -- If the batch errored, reset processing state so the addon doesn't get stuck.
-    -- isProcessing/pendingCloseFinalize staying true would silently block all future scans.
-    if not ok then
-        AG:Debug("ProcessBatch error: " .. tostring(err))
-        self.state.isProcessing = false
-        self.state.pendingCloseFinalize = false
-        self.state.pendingFinalize = false
-        self.accumulator = nil
-        AG:Print("|cFFFF6600Scan error.|r Processing failed, scan discarded. Try again.")
-    end
-end
-
 -- Schedule finalization with debounce
 function Scanner:ScheduleFinalize()
     self.state.lastEventTime = GetTime()
@@ -328,7 +203,7 @@ function Scanner:TryFinalize()
         return
     end
 
-    -- Still processing GetAll batches? Wait more.
+    -- Still processing batches? Wait more.
     if self.state.isProcessing then
         AG:Debug("Still processing batches, rescheduling finalization...")
         C_Timer.After(DEBOUNCE_DELAY, function()
@@ -735,15 +610,26 @@ function Scanner:FlushAsyncSave()
     end
 end
 
--- Handle AH close: save accumulated data instead of discarding
+-- Handle AH close.
+-- DEFAULT when a read is mid-flight is the SAFE one: finish reading in the background and
+-- save. This is the original, battle-tested legacy behaviour (the GetAll buffer persists
+-- after close). Only a backend that explicitly OPTS IN via `discardOnClose` aborts instead
+-- (the modern replicate backend, whose buffer truncates on close). Defaulting to "finish"
+-- means a missing / not-yet-loaded backend can never silently discard a legacy scan.
 function Scanner:OnAuctionHouseClosed()
-    -- If GetAll batches are still running, let them finish in the background.
-    -- The data was already fetched from the server; the client buffer persists after close.
-    -- ProcessBatch will finalize when all batches are done.
     if self.state.isProcessing then
-        AG:Print("|cFFFF9900Auction house closed.|r Finishing scan in background...")
-        self.state.pendingCloseFinalize = true
-        self.state.pendingFinalize = false
+        -- Use the backend that actually started this read (capture is dual-listen, so the
+        -- active backend may differ from the capturing one). Modern's replicate buffer
+        -- truncates on close -> abort; legacy's GetAll buffer persists -> finish + save.
+        local cap = self.state.capturingBackend
+        if cap and cap.discardOnClose then
+            AG:Print("|cFFFF9900Auction house closed mid-scan — scan cancelled.|r Keep the AH open until the scan finishes.")
+            self:CancelCapture()
+        else
+            AG:Print("|cFFFF9900Auction house closed.|r Finishing scan in background...")
+            self.state.pendingCloseFinalize = true
+            self.state.pendingFinalize = false
+        end
         return
     end
 
@@ -784,57 +670,4 @@ function Scanner:CancelCapture()
         AG:Debug("Accumulator cleared (" .. self.accumulator.totalAuctions .. " auctions discarded)")
         self.accumulator = nil
     end
-end
-
--- Get current auction count
-function Scanner:GetAuctionCount()
-    local batch, total = GetNumAuctionItems("list")
-    return total or 0
-end
-
--- Get info for a single auction
--- @param index number - Auction index (1-based)
--- @return table - Auction data
-function Scanner:GetAuctionInfo(index, withOwner, withBid)
-    -- GetAuctionItemInfo returns:
-    -- name, texture, count, quality, canUse, level, levelColHeader,
-    -- minBid, minIncrement, buyoutPrice, bidAmount, highBidder,
-    -- bidderFullName, owner, ownerFullName, saleStatus, itemId, hasAllInfo
-
-    local name, texture, count, quality, canUse, level, levelColHeader,
-          minBid, minIncrement, buyoutPrice, bidAmount, highBidder,
-          bidderFullName, owner, ownerFullName, saleStatus, itemId, hasAllInfo =
-          GetAuctionItemInfo("list", index)
-
-    -- Skip if no data
-    if not name or not itemId then
-        return nil
-    end
-
-    -- Get time left (1=short, 2=medium, 3=long, 4=very long)
-    local timeLeft = GetAuctionItemTimeLeft("list", index)
-
-    -- Build auction record
-    local auction = {
-        itemId = itemId,
-        name = name,
-        count = count or 1,
-        quality = quality or 0,
-        level = level or 0,
-        minBid = minBid or 0,
-        buyout = buyoutPrice or 0,
-        timeLeft = timeLeft,
-    }
-
-    -- Optional fields
-    if withBid then
-        auction.bidAmount = bidAmount or 0
-        auction.highBidder = highBidder
-    end
-
-    if withOwner then
-        auction.owner = owner
-    end
-
-    return auction
 end
