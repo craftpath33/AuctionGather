@@ -93,7 +93,8 @@ local function serializeItems(items)
         local auctionParts = {}
         for _, a in ipairs(itemData.auctions) do
             -- count,minBid,buyout,timeLeft (owner removed for size)
-            table.insert(auctionParts, string.format("%d,%d,%d,%d",
+            -- %.0f for prices: 32-bit %d overflows above 214,748g in copper
+            table.insert(auctionParts, string.format("%d,%.0f,%.0f,%d",
                 a.count or 1,
                 a.minBid or 0,
                 a.buyout or 0,

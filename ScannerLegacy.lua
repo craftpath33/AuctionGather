@@ -336,7 +336,7 @@ function Legacy:ProcessBatch()
     -- If the batch errored, reset processing state so the addon doesn't get stuck.
     -- isProcessing/pendingCloseFinalize staying true would silently block all future scans.
     if not ok then
-        AG:Debug("ProcessBatch error: " .. tostring(err))
+        AG:Warn("ProcessBatch error (legacy): " .. tostring(err))
         Engine.state.isProcessing = false
         Engine.state.pendingCloseFinalize = false
         Engine.state.pendingFinalize = false

@@ -333,10 +333,13 @@ function Scanner:AsyncSaveStep()
                 local itemId   = s.itemList[i]
                 local itemData = s.items[itemId]
 
-                -- Build auction entries: count,minBid,buyout,timeLeft
+                -- Build auction entries: count,minBid,buyout,timeLeft.
+                -- Prices use %.0f, NOT %d: this client's string.format("%d") is 32-bit
+                -- and a buyout above 214,748g (2^31-1 copper) raises "integer overflow"
+                -- — real MoP prices cross that. %.0f prints the same digits losslessly.
                 local auctionParts = {}
                 for _, a in ipairs(itemData.auctions) do
-                    auctionParts[#auctionParts + 1] = string.format("%d,%d,%d,%d",
+                    auctionParts[#auctionParts + 1] = string.format("%d,%.0f,%.0f,%d",
                         a.count    or 1,
                         a.minBid   or 0,
                         a.buyout   or 0,
@@ -347,7 +350,7 @@ function Scanner:AsyncSaveStep()
                 -- Format: itemId:name:quality:level:auctions
                 s.lines[#s.lines + 1] = string.format("%d:%s:%d:%d:%s",
                     itemId,
-                    (itemData.name or ""):gsub(":", ""),  -- strip colons from name
+                    tostring(itemData.name or ""):gsub(":", ""),  -- strip colons from name
                     itemData.quality or 0,
                     itemData.level   or 0,
                     table.concat(auctionParts, ";")
@@ -466,9 +469,11 @@ function Scanner:AsyncSaveStep()
         end
     end)
 
-    -- If any phase errored, reset async state to avoid stuck pipeline
+    -- If any phase errored, reset async state to avoid stuck pipeline.
+    -- Warn (not Debug): the details land in the persistent error log too.
     if not ok then
-        AG:Debug("AsyncSaveStep error: " .. tostring(err))
+        local phase = self.asyncSave and self.asyncSave.phase or "?"
+        AG:Warn("Async save error (phase=" .. phase .. "): " .. tostring(err))
         AG:Print("|cFFFF6600Async save error.|r Scan data may not have been saved.")
         self.asyncSave = nil
     end
@@ -501,7 +506,8 @@ function Scanner:FlushAsyncSave()
 
                     local auctionParts = {}
                     for _, a in ipairs(itemData.auctions) do
-                        auctionParts[#auctionParts + 1] = string.format("%d,%d,%d,%d",
+                        -- %.0f for prices: 32-bit %d overflows above 214,748g (see AsyncSaveStep)
+                        auctionParts[#auctionParts + 1] = string.format("%d,%.0f,%.0f,%d",
                             a.count    or 1,
                             a.minBid   or 0,
                             a.buyout   or 0,
@@ -602,7 +608,8 @@ function Scanner:FlushAsyncSave()
         end)
 
         if not ok then
-            AG:Debug("FlushAsyncSave error: " .. tostring(err))
+            local phase = s and s.phase or "?"
+            AG:Warn("Flush error (phase=" .. phase .. "): " .. tostring(err))
             AG:Print("|cFFFF6600Flush error.|r Scan data may not have been saved.")
             self.asyncSave = nil
             break

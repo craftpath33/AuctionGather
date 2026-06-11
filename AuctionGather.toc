@@ -3,7 +3,7 @@
 ## Notes: Lightweight auction scanner - listens and stores encoded auction data
 ## Notes-ruRU: Лёгкий сканер аукциона - слушает и сохраняет закодированные данные
 ## Author: n1ghtwolf
-## Version: 0.2.7
+## Version: 0.2.10
 ## SavedVariables: AUCTION_GATHER_DATA, AUCTION_GATHER_CONFIG, AUCTION_GATHER_DEBUG_LOG
 ## SavedVariablesPerCharacter: AUCTION_GATHER_CHARACTER
 

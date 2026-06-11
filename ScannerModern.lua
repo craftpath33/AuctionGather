@@ -34,6 +34,7 @@ local Modern = AG.Scanner.modern
 local REPLICATE_BATCH_SIZE  = 250    -- Items per batch (matches Auctionator's stepSize)
 local REPLICATE_BATCH_DELAY = 0.01   -- Delay between batches in seconds
 local REPLICATE_COOLDOWN    = 15 * 60 -- ReplicateItems server cooldown (15 min)
+local BROWSE_TRIGGER_DELAY  = 1.0    -- Let the detected browse query leave first
 
 -- Cooldown tracking for the optional active trigger (modern-only concern,
 -- kept off the shared engine state since it has no legacy counterpart)
@@ -45,7 +46,83 @@ Modern.lastTrigger = nil
 Modern.discardOnClose = true
 
 function Modern:Initialize()
+    self:InstallBrowseWatch()
     AG:Debug("Modern scanner backend ready")
+end
+
+-- Auctionator's DEFAULT (non-alternate) full scan on the modern AH walks browse
+-- queries (SendBrowseQuery + RequestMoreBrowseResults). Browse results are per-item
+-- summaries (min price + total quantity) with no individual lots — nothing we can
+-- store, and no replicate event ever fires. But an EMPTY browse query is an
+-- unambiguous "someone is full-scanning right now" signal: piggyback by firing our
+-- own ReplicateItems(), which yields the same full per-lot data as the alternate
+-- mode — the user keeps their habits and learns nothing new.
+function Modern:InstallBrowseWatch()
+    if self.browseWatchInstalled then
+        return
+    end
+    if not (C_AuctionHouse and C_AuctionHouse.SendBrowseQuery and hooksecurefunc) then
+        return  -- no modern browse API on this client
+    end
+
+    self.browseWatchInstalled = true
+    hooksecurefunc(C_AuctionHouse, "SendBrowseQuery", function(query)
+        if Modern:IsFullBrowseQuery(query) then
+            Modern:OnFullBrowseDetected()
+        end
+    end)
+    AG:Debug("Browse watch installed (SendBrowseQuery hook)")
+end
+
+-- An empty query (no search text, no level bounds, no filters) is a whole-AH
+-- browse — the signature of a scanning addon's full scan, not a user item search.
+function Modern:IsFullBrowseQuery(query)
+    if type(query) ~= "table" then
+        return false
+    end
+    if (query.searchString or "") ~= "" then
+        return false
+    end
+    if query.minLevel or query.maxLevel then
+        return false
+    end
+    if type(query.filters) == "table" and #query.filters > 0 then
+        return false
+    end
+    if type(query.itemClassFilters) == "table" and #query.itemClassFilters > 0 then
+        return false
+    end
+
+    return true
+end
+
+-- A full browse scan just started: request our own replica of the AH.
+function Modern:OnFullBrowseDetected()
+    if not AUCTION_GATHER_CONFIG or not AUCTION_GATHER_CONFIG.autoScan then
+        return
+    end
+    if Engine.state.isProcessing then
+        AG:Debug("Full browse detected — skip, a capture is already running")
+        return
+    end
+    if not self:CanTrigger() then
+        AG:Debug("Full browse detected — skip, replicate is on cooldown")
+        return
+    end
+
+    -- SendBrowseQuery implies the AH is open even if our SHOW event was missed.
+    AG.State.auctionHouseOpen = true
+
+    AG:Print("Full scan by another addon detected — capturing auction data...")
+
+    -- Let the browse query leave first, then request the replica. Completion
+    -- arrives via the passive OnReplicateUpdate handler.
+    C_Timer.After(BROWSE_TRIGGER_DELAY, function()
+        if AG.State.auctionHouseOpen and not Engine.state.isProcessing and Modern:CanTrigger() then
+            Modern.lastTrigger = time()
+            C_AuctionHouse.ReplicateItems()
+        end
+    end)
 end
 
 -- Called on each REPLICATE_ITEM_LIST_UPDATE event (our trigger OR another addon's).
@@ -195,7 +272,7 @@ function Modern:ProcessBatch()
 
     -- If the batch errored, reset processing state so the addon doesn't get stuck.
     if not ok then
-        AG:Debug("ProcessBatch error: " .. tostring(err))
+        AG:Warn("ProcessBatch error (modern): " .. tostring(err))
         Engine.state.isProcessing = false
         Engine.state.pendingCloseFinalize = false
         Engine.state.pendingFinalize = false
