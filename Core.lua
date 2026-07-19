@@ -10,7 +10,7 @@
 local ADDON_NAME, AG = ...
 
 -- Version info
-AG.VERSION = "0.2.10"
+AG.VERSION = "0.2.11"
 AG.BUILD = 12
 
 -- Debug mode (off by default, toggle with /ag debug)
