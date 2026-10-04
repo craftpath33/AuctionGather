@@ -1,9 +1,9 @@
-## Interface: 50504, 20506, 11508
+## Interface: 120100, 50504, 20506, 16001, 11509
 ## Title: AuctionGather
 ## Notes: Lightweight auction scanner - listens and stores encoded auction data
 ## Notes-ruRU: Лёгкий сканер аукциона - слушает и сохраняет закодированные данные
 ## Author: n1ghtwolf
-## Version: 0.2.11
+## Version: 0.2.12
 ## SavedVariables: AUCTION_GATHER_DATA, AUCTION_GATHER_CONFIG, AUCTION_GATHER_DEBUG_LOG
 ## SavedVariablesPerCharacter: AUCTION_GATHER_CHARACTER
 

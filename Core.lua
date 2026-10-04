@@ -10,8 +10,8 @@
 local ADDON_NAME, AG = ...
 
 -- Version info
-AG.VERSION = "0.2.11"
-AG.BUILD = 12
+AG.VERSION = "0.2.12"
+AG.BUILD = 13
 
 -- Debug mode (off by default, toggle with /ag debug)
 AG.DEBUG = false
@@ -168,10 +168,25 @@ function AG:GetRegion()
     return regions[regionId] or "Unknown"
 end
 
+-- WoW: Forever clients: interface numbers 16000-19999 (16001 in the beta, client 1.60.x).
+local FOREVER_TOC_MIN = 16000
+local FOREVER_TOC_MAX = 20000
+
+-- Retail clients: six-digit interface numbers since 10.0 (12.1.0 = 120100).
+local RETAIL_TOC_MIN = 100000
+
 -- Detection uses tocVersion from GetBuildInfo(): expansion * 10000 + minor * 100 + patch.
 function AG:GetGameVersion()
     local _, _, _, tocVersion = GetBuildInfo()
     if not tocVersion then return "unknown" end
+
+    if tocVersion >= FOREVER_TOC_MIN and tocVersion < FOREVER_TOC_MAX then
+        return "forever"
+    end
+
+    if tocVersion >= RETAIL_TOC_MIN then
+        return "retail"
+    end
 
     local expansion = math.floor(tocVersion / 10000)
     local versions = {
